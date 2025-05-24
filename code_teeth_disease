@@ -1,0 +1,712 @@
+import zipfile
+import os
+
+zip_path = "/content/archive (7).zip"
+extract_path = "teeth3"    # Destination folder
+
+with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+    zip_ref.extractall(extract_path)
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import numpy as np
+from PIL import Image
+import os
+import random
+import json
+import subprocess
+import warnings
+from tqdm import tqdm
+
+# Suppress warnings for clarity
+warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Set seeds for reproducibility
+np.random.seed(42)
+random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+
+# Device configuration
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+NUM_GPUS = torch.cuda.device_count()
+
+if torch.cuda.is_available():
+    print(f"CUDA is available. Device(s) {NUM_GPUS} : {torch.cuda.get_device_name(0)}")
+    try:
+        gpu_info = subprocess.check_output(['nvidia-smi'], encoding='utf-8')
+        print(gpu_info)
+    except Exception as e:
+        print(f"Error while retrieving GPU info: {e}")
+else:
+    print("Running on CPU.")
+
+# ======================
+#      Dataset
+# ======================
+class TeethDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        super(TeethDataset, self).__init__()
+        self.root_dir = root_dir
+        self.transform = transform
+        # Only include directories (classes) and ignore any non-directory files
+        self.classes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
+        self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
+        self.data_list = self._load_data_list()
+
+    def _load_data_list(self):
+        data_list = []
+        for class_name in self.classes:
+            class_dir = os.path.join(self.root_dir, class_name)
+            for img_name in os.listdir(class_dir):
+                img_path = os.path.join(class_dir, img_name)
+                if os.path.isfile(img_path):
+                    data_list.append((img_path, self.class_to_idx[class_name]))
+        return data_list
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        image_path, label = self.data_list[idx]
+        img = Image.open(image_path).convert('RGB')
+        img = np.array(img)  # Convert PIL image to numpy array for Albumentations
+        if self.transform:
+            img = self.transform(image=img)["image"]
+        return img, label
+
+# ======================
+#    Transforms & Loaders
+# ======================
+BATCH_SIZE = 8
+NUM_WORKERS = 0  # Change to >0 if your system supports multiprocessing
+IMG_SIZE = 128
+
+TRAIN_TRANSFORM = A.Compose([
+    A.Resize(height=IMG_SIZE, width=IMG_SIZE, p=1.0),
+    A.HorizontalFlip(p=0.5),
+    A.RandomBrightnessContrast(p=0.5),
+    A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=30, p=0.5),
+    A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.5),
+    A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
+    A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
+    A.CLAHE(p=0.1),
+    A.RandomGamma(p=0.2),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
+])
+
+TEST_TRANSFORM = A.Compose([
+    A.Resize(height=IMG_SIZE, width=IMG_SIZE, p=1.0),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
+])
+
+# Ensure dataset paths are built correctly.
+data_dir = '/content/teeth3/Teeth_DataSet/Teeth_Dataset'
+train_dataset = TeethDataset(root_dir=os.path.join(data_dir, 'Training'), transform=TRAIN_TRANSFORM)
+val_dataset   = TeethDataset(root_dir=os.path.join(data_dir, 'Testing'), transform=TEST_TRANSFORM)
+test_dataset  = TeethDataset(root_dir=os.path.join(data_dir, 'Testing'), transform=TEST_TRANSFORM)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=NUM_WORKERS)
+val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=NUM_WORKERS)
+test_loader  = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=NUM_WORKERS)
+
+NUM_TRAIN_SAMPLES = len(train_dataset)
+NUM_VAL_SAMPLES   = len(val_dataset)
+NUM_TEST_SAMPLES  = len(test_dataset)
+NUM_CLASSES = len(train_dataset.classes)
+
+sample_data, sample_label = next(iter(test_loader))
+sample_data, sample_label = sample_data.to(DEVICE), sample_label.to(DEVICE)
+print(f"Number of train samples: {NUM_TRAIN_SAMPLES}")
+print(f"Number of val samples: {NUM_VAL_SAMPLES}")
+print(f"Number of test samples: {NUM_TEST_SAMPLES}")
+print(f"Number of classes: {NUM_CLASSES} --> {train_dataset.classes}")
+print(f"Sample data shape (B, C, H, W): {sample_data.shape}")
+
+
+
+# ======================
+#   CNN and ViT Model
+# ======================
+
+class CNN(nn.Module):
+    def __init__(self, in_channels=3):
+        super(CNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+    def forward(self, x):
+        return self.features(x)
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size, patch_size, in_channels, embed_dim):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) * (img_size // patch_size)
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        x = self.proj(x) # (B, E, H', W')
+        x = x.flatten(2) # (B, E, H'*W')
+        x = x.transpose(1, 2) # (B, H'*W', E)
+        return x
+
+class Attention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = embed_dim // num_heads
+        self.scale = head_dim ** -0.5
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        return x
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4., drop=0., attn_drop=0.):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = Attention(embed_dim, num_heads)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        mlp_hidden_dim = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, embed_dim),
+            nn.Dropout(drop)
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class VisionTransformer(nn.Module):
+    def __init__(self, img_size, patch_size, in_channels, embed_dim, num_heads, num_layers, num_classes, mlp_ratio=4., drop_rate=0.):
+        super().__init__()
+        self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        self.blocks = nn.Sequential(*[
+            TransformerBlock(embed_dim, num_heads, mlp_ratio, drop=drop_rate)
+            for _ in range(num_layers)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x):
+        x = self.patch_embed(x)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        x = x.mean(dim=1) # Global average pooling over patches
+        x = self.head(x)
+        return x
+
+class CNNViT(nn.Module):
+    def __init__(self, num_classes, cnn_out_channels=256, vit_img_size=16, vit_patch_size=4, vit_embed_dim=128, vit_num_heads=4, vit_num_layers=2):
+        super().__init__()
+        self.cnn = CNN(in_channels=3)
+
+        # Calculate the effective image size after CNN layers
+        # Assuming MaxPool2d with kernel_size=2 and stride=2 is used 3 times
+        effective_img_size = IMG_SIZE // (2 ** 3) # Should be IMG_SIZE // 8
+
+        self.vit = VisionTransformer(
+            img_size=effective_img_size, # Use the reduced size
+            patch_size=vit_patch_size,
+            in_channels=cnn_out_channels, # Input channels to ViT are the output channels of CNN
+            embed_dim=vit_embed_dim,
+            num_heads=vit_num_heads,
+            num_layers=vit_num_layers,
+            num_classes=num_classes
+        )
+
+    def forward(self, x):
+        x = self.cnn(x) # (B, cnn_out_channels, H_eff, W_eff)
+        # ViT expects input in the form (B, C, H, W) for patch embedding
+        x = self.vit(x) # (B, num_classes)
+        return x
+
+# Model Parameters
+CNN_OUT_CHANNELS = 256 # Output channels of the last CNN layer
+VIT_IMG_SIZE_EFF = IMG_SIZE // (2 ** 3) # Effective image size after 3 pooling layers
+VIT_PATCH_SIZE = 4
+VIT_EMBED_DIM = 128
+VIT_NUM_HEADS = 4
+VIT_NUM_LAYERS = 2
+
+# Instantiate the model
+model = CNNViT(
+    num_classes=NUM_CLASSES,
+    cnn_out_channels=CNN_OUT_CHANNELS,
+    vit_img_size=VIT_IMG_SIZE_EFF,
+    vit_patch_size=VIT_PATCH_SIZE,
+    vit_embed_dim=VIT_EMBED_DIM,
+    vit_num_heads=VIT_NUM_HEADS,
+    vit_num_layers=VIT_NUM_LAYERS
+).to(DEVICE)
+
+print(model)
+
+# Print model summary (optional, requires torchinfo)
+try:
+    from torchinfo import summary
+    summary(model, input_size=(BATCH_SIZE, 3, IMG_SIZE, IMG_SIZE), device=DEVICE)
+except ImportError:
+    print("Install torchinfo for model summary: !pip install torchinfo")
+
+
+# ======================
+#       Training Utils
+# ======================
+class History:
+    def __init__(self):
+        self.history = {
+            "train_loss": [],
+            "val_loss": [],
+            "train_acc": [],
+            "val_acc": [],
+        }
+
+    def log(self, train_loss, val_loss, train_acc, val_acc):
+        self.history["train_loss"].append(train_loss)
+        self.history["val_loss"].append(val_loss)
+        self.history["train_acc"].append(train_acc)
+        self.history["val_acc"].append(val_acc)
+
+    def save_to_file(self, path=None):
+        if not path:
+            raise ValueError("Path is not specified")
+        with open(path, 'w') as f:
+            json.dump(self.history, f, indent=4)
+        print(f"History saved to {path}.")
+
+    def load_from_file(self, path):
+        with open(path, 'r') as f:
+            self.history = json.load(f)
+        print(f"History loaded from {path}.")
+
+class Callback:
+    def __init__(self, optimizer, ultimate_patience=15, lr_patience=6, acc_threshold=1e-5, lr_factor=0.5,
+                 min_lr=1e-7, checkpoint_path='./best_model.pth', verbose=False):
+        self.ultimate_patience = ultimate_patience
+        self.lr_patience = lr_patience
+        self.acc_threshold = acc_threshold
+        self.lr_factor = lr_factor
+        self.min_lr = min_lr
+        self.checkpoint_path = checkpoint_path
+        self.best_val_acc = -np.inf
+        self.epochs_no_improve = 0
+        self.early_stop = False
+        self.verbose = verbose
+        self.optimizer = optimizer  # Store the optimizer reference
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='max',
+            patience=self.lr_patience,
+            factor=self.lr_factor,
+            min_lr=self.min_lr,
+            verbose=True,
+        )
+
+    def on_epoch_end(self, epoch, val_acc, model):
+        old_lr = self.optimizer.param_groups[0]['lr']
+        self.scheduler.step(val_acc)
+        new_lr = self.optimizer.param_groups[0]['lr']
+
+        if val_acc >= self.best_val_acc + self.acc_threshold:
+            if self.verbose:
+                print(f"Validation acc improved from {self.best_val_acc:.6f} to {val_acc:.6f} ... Saved checkpoint!")
+            self.best_val_acc = val_acc
+            self.epochs_no_improve = 0
+            self.save_checkpoint(model)
+        else:
+            self.epochs_no_improve += 1
+            if self.verbose:
+                print(f"Validation acc {val_acc:.6f} did not improve from the best {self.best_val_acc:.6f} ... Epochs without improvement: {self.epochs_no_improve}/{self.ultimate_patience}")
+            if old_lr != new_lr and self.verbose:
+                print(f"ReduceLROnPlateau: Learning rate changed from {old_lr} to {new_lr}")
+            if self.epochs_no_improve >= self.ultimate_patience:
+                self.early_stop = True
+                if self.verbose:
+                    print(f"Early stopping triggered ... No improvement for {self.ultimate_patience} epochs!")
+
+    def save_checkpoint(self, model):
+        torch.save(model.state_dict(), self.checkpoint_path)
+
+    def should_stop(self):
+        return self.early_stop
+
+    def load_best_weights(self, model):
+        if os.path.exists(self.checkpoint_path):
+            model.load_state_dict(torch.load(self.checkpoint_path))
+            print(f"Loaded weights with best validation accuracy: {self.best_val_acc:.4f} from {self.checkpoint_path}")
+        else:
+            print(f"No checkpoint found at {self.checkpoint_path}. Cannot load best weights.")
+
+def validation(model, val_loader, criterion, device='cuda'):
+    model.eval()
+    batch_loss, correct_item, total_item = 0.0, 0, 0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            batch_loss += loss.item() * labels.size(0)
+            _, predicted = torch.max(outputs, 1)
+            total_item += labels.size(0)
+            correct_item += (predicted == labels).sum().item()
+    avg_loss = batch_loss / total_item
+    avg_acc = correct_item / total_item
+    print(f"Validation | Loss: {avg_loss:.6f} | Accuracy: {avg_acc:.6f}")
+    return avg_acc, avg_loss
+
+def train(model, train_loader, val_loader, criterion, optimizer, num_epochs=100, device='cuda', verbose=False):
+    callback = Callback(optimizer, verbose=True)
+    history = History()
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss, correct, total = 0.0, 0, 0
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training", leave=True) if verbose else train_loader
+        for images, labels in train_bar:
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * labels.size(0)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            if verbose:
+                train_acc = correct / total
+                train_loss = running_loss / total
+                current_lr = optimizer.param_groups[0]['lr']
+                train_bar.set_postfix(loss=train_loss, accuracy=train_acc, lr=current_lr)
+        if val_loader is not None:
+            val_acc, val_loss = validation(model, val_loader, criterion, device=device)
+        history.log(train_loss, val_loss, train_acc, val_acc)
+        callback.on_epoch_end(epoch, val_acc, model)
+        if callback.should_stop():
+            break
+    callback.load_best_weights(model)
+    return history
+
+# Training parameters
+LEARNING_RATE = 1e-3
+NUM_EPOCHS = 100
+
+# Loss and optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+# Start training
+print("Starting training...")
+history = train(
+    model,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    num_epochs=NUM_EPOCHS,
+    device=DEVICE,
+    verbose=True # Set to False to disable tqdm bar
+)
+
+print(f"Validation Loss: {history.history['val_loss'][-1]:.6f}")
+print(f"Validation Accuracy: {history.history['val_acc'][-1]:.6f}")
+print(f"Train Loss: {history.history['train_loss'][-1]:.6f}")
+print(f"Train Accuracy: {history.history['train_acc'][-1]:.6f}")
+
+#MORE INCREASING THE ACCURACY TO NEED MODEL TUNED
+
+
+try:
+    TRAIN_TRANSFORM = A.Compose([
+        A.Resize(height=IMG_SIZE, width=IMG_SIZE, p=1.0),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.2),
+        A.RandomBrightnessContrast(p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=30, p=0.5),
+        A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.5),
+        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
+        A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+        A.CLAHE(p=0.1),
+        A.RandomGamma(p=0.2),
+        A.CoarseDropout(max_holes=8, max_height=8, max_width=8, fill_value=0, p=0.3),
+        A.Cutout(num_holes=8, max_h_size=8, max_w_size=8, fill_value=0, p=0.3),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+    print("Albumentations transforms composed successfully including Cutout.")
+except AttributeError:
+    print("Albumentations version does not support Cutout. Please install a recent version (>= 0.6.0).")
+    # Fallback to transforms without Cutout if needed
+    TRAIN_TRANSFORM = A.Compose([
+        A.Resize(height=IMG_SIZE, width=IMG_SIZE, p=1.0),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.2),
+        A.RandomBrightnessContrast(p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=30, p=0.5),
+        A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.5),
+        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
+        A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+        A.CLAHE(p=0.1),
+        A.RandomGamma(p=0.2),
+        A.CoarseDropout(max_holes=8, max_height=8, max_width=8, fill_value=0, p=0.3),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+    print("Proceeding without Cutout due to version issue.")
+
+
+# Re-create data loaders with potentially new batch size and transforms
+train_dataset = TumorDataset(root_dir=os.path.join(data_dir, 'Training'), transform=TRAIN_TRANSFORM)
+val_dataset   = TumorDataset(root_dir=os.path.join(data_dir, 'Testing'), transform=TEST_TRANSFORM)
+test_dataset  = TumorDataset(root_dir=os.path.join(data_dir, 'Testing'), transform=TEST_TRANSFORM)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=NUM_WORKERS)
+val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=NUM_WORKERS)
+test_loader  = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, pin_memory=True, num_workers=NUM_WORKERS)
+
+
+# --- Add Weight Decay to Optimizer ---
+# Loss and optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5) # Added weight_decay
+
+# --- Adjust Callback Parameters (Optional) ---
+# callback = Callback(optimizer, ultimate_patience=20, lr_patience=8, acc_threshold=1e-6, lr_factor=0.5, min_lr=1e-7, checkpoint_path='./best_model.pth', verbose=True)
+
+
+# Start training with potentially updated parameters
+
+history = train(
+    model,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    num_epochs=NUM_EPOCHS,
+    device=DEVICE,
+    verbose=True
+)
+
+
+# Plot training & validation accuracy values
+plt.figure(figsize=(12, 6))
+plt.plot(history.history['train_acc'])
+plt.plot(history.history['val_acc'])
+plt.title('Model Accuracy')
+plt.ylabel('Accuracy')
+plt.xlabel('Epoch')
+plt.legend(['Train', 'Val'], loc='upper left')
+plt.grid(True)
+plt.show()
+
+
+
+# Plotting the history
+plt.figure(figsize=(12, 5))
+
+# Plot Loss
+plt.subplot(1, 2, 1)
+plt.plot(history.history['train_loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Loss per Epoch')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+
+# Plot Accuracy
+plt.subplot(1, 2, 2)
+plt.plot(history.history['train_acc'], label='Train Accuracy')
+plt.plot(history.history['val_acc'], label='Validation Accuracy')
+plt.title('Accuracy per Epoch')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+
+# Evaluate the model on the test set to get predictions and true labels
+model.eval()
+all_preds = []
+all_labels = []
+with torch.no_grad():
+    for images, labels in tqdm(test_loader, desc="Generating Confusion Matrix Data", leave=False):
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+        outputs = model(images)
+        _, predicted = torch.max(outputs, 1)
+        all_preds.extend(predicted.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+# Compute the confusion matrix
+cm = confusion_matrix(all_labels, all_preds)
+
+# Get class names
+class_names = test_dataset.classes
+
+# Display the confusion matrix
+plt.figure(figsize=(10, 8))
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+disp.plot(cmap=plt.cm.Blues, values_format='d')
+plt.title('Confusion Matrix')
+plt.show()
+
+print("Confusion Matrix:")
+cm
+
+
+# --- Final Test Set Evaluation ---
+print("Evaluating the model on the test set...")
+model.eval() # Set the model to evaluation mode
+correct_test = 0
+total_test = 0
+with torch.no_grad():
+    for images, labels in tqdm(test_loader, desc="Evaluating Test Set", leave=False):
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+        outputs = model(images)
+        _, predicted = torch.max(outputs.data, 1)
+        total_test += labels.size(0)
+        correct_test += (predicted == labels).sum().item()
+
+test_accuracy = correct_test / total_test
+print(f"Accuracy on the test set: {100 * test_accuracy:.2f}%")
+
+# TO CHECK THE RANDOM PIC TO TEST MODEL
+
+
+
+import numpy as np
+from google.colab import files
+from PIL import Image
+
+def predict_single_image(model, image_path, transform, class_names, device):
+    """
+    Loads a single image, preprocesses it, and makes a prediction using the model.
+
+    Args:
+        model (torch.nn.Module): The trained PyTorch model.
+        image_path (str): The path to the image file.
+        transform (albumentations.Compose): The transform to apply to the image.
+        class_names (list): A list of class names.
+        device (torch.device): The device to run the model on.
+
+    Returns:
+        tuple: A tuple containing the predicted class index and the predicted class name.
+    """
+    try:
+        img = Image.open(image_path).convert('RGB')
+        img = np.array(img) # Convert PIL image to numpy array for Albumentations
+        if transform:
+            transformed_img = transform(image=img)["image"]
+        else:
+             # If no transform, just convert to tensor and normalize manually
+            transformed_img = ToTensorV2()(image=img)['image']
+            transformed_img = A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))(image=transformed_img.permute(1, 2, 0).numpy())['image']
+            transformed_img = ToTensorV2()(image=transformed_img)['image']
+
+
+        img_tensor = transformed_img.unsqueeze(0).to(device) # Add batch dimension and move to device
+
+        model.eval() # Set model to evaluation mode
+        with torch.no_grad():
+            outputs = model(img_tensor)
+            _, predicted_idx = torch.max(outputs, 1)
+            predicted_idx = predicted_idx.item()
+
+        predicted_class_name = class_names[predicted_idx]
+
+        return predicted_idx, predicted_class_name
+
+    except FileNotFoundError:
+        print(f"Error: File not found at {image_path}")
+        return None, None
+    except Exception as e:
+        print(f"An error occurred during prediction: {e}")
+        return None, None
+
+# Upload a file
+uploaded = files.upload()
+
+# Assuming only one file is uploaded for prediction
+if uploaded:
+    image_filename = next(iter(uploaded))
+    print(f'Uploaded file: {image_filename}')
+
+    # Define the path to the uploaded file
+    uploaded_image_path = f'/content/{image_filename}'
+
+    # Ensure the model is loaded and on the correct device
+    # model is already defined and loaded from the previous code block
+    # device is already defined
+
+    # Use the test transform for single image prediction
+    single_image_transform = TEST_TRANSFORM
+
+    # Get the class names from the dataset (assuming test_dataset has been created)
+    if 'test_dataset' in globals():
+        class_names = test_dataset.classes
+        print(f"Class names: {class_names}")
+    else:
+        print("Error: test_dataset is not defined. Cannot get class names.")
+        class_names = ["Class 0", "Class 1", "Class 2", "..."] # Provide a default or handle error
+
+    # Make prediction
+    predicted_idx, predicted_class_name = predict_single_image(
+        model,
+        uploaded_image_path,
+        single_image_transform,
+        class_names,
+        DEVICE
+    )
+
+    if predicted_class_name is not None:
+        print(f"The uploaded image is predicted as: {predicted_class_name} (Class Index: {predicted_idx})")
+
+else:
+    print("No file was uploaded.")
